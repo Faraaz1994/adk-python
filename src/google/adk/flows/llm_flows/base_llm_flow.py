@@ -41,7 +41,6 @@ from ...events.event import Event
 from ...models.base_llm_connection import BaseLlmConnection
 from ...models.llm_request import LlmRequest
 from ...models.llm_response import LlmResponse
-from ...telemetry import tracing
 from ...telemetry.tracing import trace_call_llm
 from ...telemetry.tracing import trace_send_data
 from ...telemetry.tracing import tracer
@@ -67,43 +66,6 @@ DEFAULT_TASK_COMPLETION_DELAY = 1.0
 
 # Statistics configuration
 DEFAULT_ENABLE_CACHE_STATISTICS = False
-
-
-def _finalize_model_response_event(
-    llm_request: LlmRequest,
-    llm_response: LlmResponse,
-    model_response_event: Event,
-) -> Event:
-  """Finalize and build the model response event from LLM response.
-
-  Merges the LLM response data into the model response event and
-  populates function call IDs and long-running tool information.
-
-  Args:
-    llm_request: The original LLM request.
-    llm_response: The LLM response from the model.
-    model_response_event: The base event to populate.
-
-  Returns:
-    The finalized Event with LLM response data merged in.
-  """
-  finalized_event = Event.model_validate({
-      **model_response_event.model_dump(exclude_none=True),
-      **llm_response.model_dump(exclude_none=True),
-  })
-
-  if finalized_event.content:
-    function_calls = finalized_event.get_function_calls()
-    if function_calls:
-      functions.populate_client_function_call_id(finalized_event)
-      finalized_event.long_running_tool_ids = (
-          functions.get_long_running_function_calls(
-              function_calls, llm_request.tools_dict
-          )
-      )
-
-  return finalized_event
-
 
 class BaseLlmFlow(ABC):
   """A basic flow that calls the LLM in a loop until a final response is generated.
@@ -824,7 +786,7 @@ class BaseLlmFlow(ABC):
     llm = self.__get_llm(invocation_context)
 
     async def _call_llm_with_tracing() -> AsyncGenerator[LlmResponse, None]:
-      with tracer.start_as_current_span('call_llm') as span:
+      with tracer.start_as_current_span('call_llm'):
         if invocation_context.run_config.support_cfc:
           invocation_context.live_request_queue = LiveRequestQueue()
           responses_generator = self.run_live(invocation_context)
@@ -875,7 +837,6 @@ class BaseLlmFlow(ABC):
                   model_response_event.id,
                   llm_request,
                   llm_response,
-                  span,
               )
               # Runs after_model_callback if it exists.
               if altered_llm_response := await self._handle_after_model_callback(
@@ -993,9 +954,22 @@ class BaseLlmFlow(ABC):
       llm_response: LlmResponse,
       model_response_event: Event,
   ) -> Event:
-    return _finalize_model_response_event(
-        llm_request, llm_response, model_response_event
-    )
+    model_response_event = Event.model_validate({
+        **model_response_event.model_dump(exclude_none=True),
+        **llm_response.model_dump(exclude_none=True),
+    })
+
+    if model_response_event.content:
+      function_calls = model_response_event.get_function_calls()
+      if function_calls:
+        functions.populate_client_function_call_id(model_response_event)
+        model_response_event.long_running_tool_ids = (
+            functions.get_long_running_function_calls(
+                function_calls, llm_request.tools_dict
+            )
+        )
+
+    return model_response_event
 
   async def _handle_control_event_flush(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
@@ -1091,12 +1065,8 @@ class BaseLlmFlow(ABC):
 
     try:
       async with Aclosing(response_generator) as agen:
-        with tracing.use_generate_content_span(
-            llm_request, invocation_context, model_response_event
-        ) as span:
-          async for llm_response in agen:
-            tracing.trace_generate_content_result(span, llm_response)
-            yield llm_response
+        async for response in agen:
+          yield response
     except Exception as model_error:
       callback_context = CallbackContext(
           invocation_context, event_actions=model_response_event.actions
